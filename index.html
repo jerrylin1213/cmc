@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="referrer" content="no-referrer" />
+    <title>cmc</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #0b1020;
+        color: #9fb0d0;
+        font: 15px -apple-system, system-ui, "Segoe UI", sans-serif;
+      }
+      #msg {
+        display: grid;
+        place-items: center;
+        height: 100%;
+        padding: 24px;
+        box-sizing: border-box;
+        text-align: center;
+        line-height: 1.7;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="msg">解密中…</div>
+    <script>
+      /* Read-only remote copy of the crypto dashboard (see remote/publish.mjs).
+         This page is public; everything else here is AES-256-GCM ciphertext.
+         The key arrives in the URL fragment (#k=…), which browsers never send
+         to a server, and is deliberately never stored: every *.github.io page
+         of this account shares one origin, so anything put in localStorage
+         here would be readable by those other sites too. */
+      (async () => {
+        "use strict";
+        const say = (t) => {
+          const m = document.getElementById("msg");
+          if (m) m.textContent = t;
+          // pasting the full link into this same tab only changes the fragment,
+          // which doesn't reload the page by itself
+          addEventListener("hashchange", () => location.reload(), { once: true });
+        };
+        if (!window.crypto || !crypto.subtle || !window.DecompressionStream)
+          return say("這個瀏覽器太舊，無法解密（需要 iOS 16.4+ / 近期的 Chrome、Safari）。");
+        const m = /[#&]k=([A-Za-z0-9_-]{43})(?:&|$)/.exec(location.hash);
+        if (!m) return say("這個網址需要鑰匙。請用 Mac 上 `cmc remote link` 給的連結或 QR code 打開。");
+        let key;
+        try {
+          const raw = Uint8Array.from(
+            atob(m[1].replace(/-/g, "+").replace(/_/g, "/") + "="),
+            (c) => c.charCodeAt(0),
+          );
+          key = await crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["decrypt"]);
+        } catch (e) {
+          return say("鑰匙格式不對。");
+        }
+
+        const realFetch = window.fetch.bind(window);
+        const opened = new Map();
+        // File layout: 12-byte IV ‖ ciphertext ‖ 16-byte GCM tag; the file name is
+        // bound in as associated data so files can't be swapped for each other.
+        function open(name) {
+          if (opened.has(name)) return opened.get(name);
+          const p = (async () => {
+            const r = await realFetch(name + "?t=" + Date.now(), { cache: "no-store" });
+            if (!r.ok) throw new Error(name + " HTTP " + r.status);
+            const buf = new Uint8Array(await r.arrayBuffer());
+            const plain = await crypto.subtle.decrypt(
+              { name: "AES-GCM", iv: buf.subarray(0, 12), additionalData: new TextEncoder().encode(name) },
+              key,
+              buf.subarray(12),
+            );
+            const gz = new Blob([plain]).stream().pipeThrough(new DecompressionStream("gzip"));
+            return JSON.parse(await new Response(gz).text());
+          })();
+          opened.set(name, p);
+          p.catch(() => opened.delete(name));
+          return p;
+        }
+
+        let B;
+        try {
+          B = await open("bundle.bin");
+        } catch (e) {
+          return say(
+            e && e.name === "OperationError"
+              ? "鑰匙已失效（可能在 Mac 上換過鑰匙）。請用新的連結。"
+              : "載入失敗：" + (e && e.message ? e.message : e),
+          );
+        }
+
+        /* Storage: keep only public market data and display prefs in the shared
+           origin's localStorage; the ledger, borrow book and settings live in
+           memory and vanish with the tab. */
+        const KEEP = new Set([
+          "priv",
+          "pnlAmt",
+          "cryptodash:hrange:v1",
+          "cryptodash:asset-tf:v1",
+          "cryptodash:prices:v1",
+          "cryptodash:ratios:v1",
+          "cryptodash:icons:v2",
+        ]);
+        const ls = window.localStorage;
+        const SP = Storage.prototype;
+        const sGet = SP.getItem,
+          sSet = SP.setItem,
+          sDel = SP.removeItem;
+        const mem = new Map();
+        SP.getItem = function (k) {
+          if (this === ls && !KEEP.has(k)) return mem.has(k) ? mem.get(k) : null;
+          return sGet.call(this, k);
+        };
+        SP.setItem = function (k, v) {
+          if (this === ls && !KEEP.has(k)) mem.set(k, String(v));
+          else sSet.call(this, k, v);
+        };
+        SP.removeItem = function (k) {
+          if (this === ls && !KEEP.has(k)) mem.delete(k);
+          else sDel.call(this, k);
+        };
+        for (let i = ls.length - 1; i >= 0; i--) {
+          const k = ls.key(i);
+          if (k && k.startsWith("cryptodash:") && !KEEP.has(k)) sDel.call(ls, k);
+        }
+
+        /* Network: answer what serve.py would have answered on the Mac. */
+        const files = B.files || {};
+        const J = (body, status = 200) =>
+          new Response(typeof body === "string" ? body : JSON.stringify(body), {
+            status,
+            headers: { "Content-Type": "application/json" },
+          });
+
+        // MSTR: median of three independent tokenized-stock issuers (CoinGecko),
+        // the same rule serve.py uses, so the price keeps moving after the US close.
+        const TOKENIZED = {
+          MSTR: ["microstrategy-xstock", "strategy-tokenized-bstocks", "microstrategy-ondo-tokenized-stock"],
+        };
+        const TOKEN_IDS = [...new Set(Object.values(TOKENIZED).flat())];
+        let tok = { at: 0, px: {} };
+        const keepTok = (j) => {
+          const px = {};
+          for (const id of TOKEN_IDS) if (j && j[id] && j[id].usd != null) px[id] = Number(j[id].usd);
+          if (Object.keys(px).length) tok = { at: Date.now(), px };
+        };
+        async function quote(param) {
+          const syms = param.toUpperCase().split(",").map((s) => s.trim()).filter(Boolean);
+          const ids = [...new Set(syms.flatMap((s) => TOKENIZED[s] || []))];
+          if (ids.length && Date.now() - tok.at > 60e3) {
+            try {
+              const r = await realFetch(
+                "https://api.coingecko.com/api/v3/simple/price?vs_currencies=usd&ids=" + encodeURIComponent(ids.join(",")),
+              );
+              if (r.ok) keepTok(await r.json());
+            } catch (e) {
+              /* fall back to the anchor below */
+            }
+          }
+          const snap = B.quotes || {};
+          const anchorAge = Date.now() - Date.parse(B.quotesAt || B.generated);
+          const out = {};
+          for (const s of syms) {
+            const px = (TOKENIZED[s] || [])
+              .map((id) => tok.px[id])
+              .filter((x) => x > 0)
+              .sort((a, b) => a - b);
+            const n = px.length;
+            const med = n ? (n % 2 ? px[(n - 1) / 2] : (px[n / 2 - 1] + px[n / 2]) / 2) : null;
+            const anchor = snap[s] != null ? Number(snap[s]) : null;
+            // Reject a median >15% off the Mac's last trusted print, like serve.py.
+            // If that print is days old (Mac asleep), require the issuers to agree
+            // with each other instead.
+            let ok = false;
+            if (med != null)
+              ok =
+                anchor != null && anchorAge < 3 * 864e5
+                  ? Math.abs(med / anchor - 1) <= 0.15
+                  : n >= 2 && px[n - 1] / px[0] - 1 <= 0.03;
+            if (ok) out[s] = med;
+            else if (anchor != null) out[s] = anchor;
+          }
+          return J(out);
+        }
+
+        // Price history: hourly snapshots from the Mac's candle cache, used only
+        // while recent for the range; otherwise 404 → the app's CoinGecko fallback.
+        const HIST_MAX_AGE = { 1: 2, 7: 12, 30: 48, 90: 168, 365: 720, 730: 1440 }; // hours
+        async function history(sp) {
+          const days = Number(sp.get("days"));
+          const want = (sp.get("syms") || "").toUpperCase().split(",").map((s) => s.trim()).filter(Boolean);
+          try {
+            if (!HIST_MAX_AGE[days]) throw new Error("range");
+            const H = await open("hist-" + days + ".bin");
+            if (!(Date.now() - Date.parse(H.generated) < HIST_MAX_AGE[days] * 3600e3)) throw new Error("stale");
+            const series = {};
+            for (const id of want) {
+              if (!H.series[id]) throw new Error("missing " + id);
+              series[id] = H.series[id];
+            }
+            return J({ days, series });
+          } catch (e) {
+            return J({ error: String((e && e.message) || e) }, 404);
+          }
+        }
+
+        async function candles(sp) {
+          const asset = (sp.get("asset") || "").toUpperCase();
+          const interval = sp.get("interval") || "1d";
+          if (!/^[A-Z0-9.-]{1,12}$/.test(asset) || interval !== "1d")
+            return J({ error: "Invalid asset or candle interval" }, 400);
+          try {
+            const H = await open("ohlc-" + interval + ".bin");
+            const data = H.series && H.series[asset];
+            if (!data || !Array.isArray(data.candles) || data.candles.length < 2)
+              throw new Error("尚未同步 " + asset + " 的 K 線，請在 Mac 開啟 cmc 後重新同步");
+            const age = Date.now() - Date.parse(data.asOf);
+            return J({ ...data, snapshot: true, stale: data.stale || !Number.isFinite(age) ||
+              age > 12 * 3600e3 });
+          } catch (e) {
+            return J({ error: "手機 K 線快照無法載入：" + ((e && e.message) || e) }, 404);
+          }
+        }
+
+        window.fetch = async (input, init) => {
+          let url;
+          try {
+            url = new URL(typeof input === "string" ? input : input.url, location.href);
+          } catch (e) {
+            return realFetch(input, init);
+          }
+          const name = url.pathname.split("/").pop();
+          const here = url.origin === location.origin;
+          if ((here || url.hostname === "raw.githubusercontent.com") && Object.prototype.hasOwnProperty.call(files, name))
+            return J(files[name]);
+          if (here && /^save/.test(name)) return J({ error: "read-only remote copy" }, 403);
+          if (here && name === "quote") return quote(url.searchParams.get("syms") || "");
+          if (here && name === "history") return history(url.searchParams);
+          if (here && name === "candles") return candles(url.searchParams);
+          if (here && /\.json$/.test(name)) return J({ error: "not in bundle" }, 404);
+          // Ride along on the app's own CoinGecko poll for the tokenized MSTR
+          // quotes, so the phone makes one rate-limited call per refresh, not two.
+          if (url.hostname === "api.coingecko.com" && url.pathname.endsWith("/simple/price")) {
+            const ids = (url.searchParams.get("ids") || "").split(",").filter(Boolean);
+            url.searchParams.set("ids", [...new Set([...ids, ...TOKEN_IDS])].join(","));
+            const r = await realFetch(url.toString(), init);
+            if (r.ok)
+              r.clone()
+                .json()
+                .then(keepTok)
+                .catch(() => {});
+            return r;
+          }
+          return realFetch(input, init);
+        };
+
+        const when = (iso) =>
+          new Date(iso).toLocaleString("zh-TW", {
+            month: "2-digit",
+            day: "2-digit",
+            hour: "2-digit",
+            minute: "2-digit",
+            hour12: false,
+          });
+        const head =
+          '<meta name="robots" content="noindex, nofollow" />' +
+          '<meta name="referrer" content="no-referrer" />' +
+          '<meta name="apple-mobile-web-app-capable" content="yes" />' +
+          '<meta name="mobile-web-app-capable" content="yes" />' +
+          '<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />' +
+          '<meta name="apple-mobile-web-app-title" content="cmc" />';
+        const badge =
+          '<div style="position:fixed;left:8px;bottom:calc(8px + env(safe-area-inset-bottom));z-index:9999;' +
+          "font:11px -apple-system,system-ui,sans-serif;color:#8aa0c8;background:rgba(13,19,34,.88);" +
+          'border:1px solid #24304a;border-radius:8px;padding:3px 8px;pointer-events:none">' +
+          "🔒 唯讀副本 · 同步 " +
+          when(B.generated) +
+          "</div>";
+        let html = String(B.app).replace(/<head([^>]*)>/i, (t) => t + head);
+        const end = html.toLowerCase().lastIndexOf("</body>");
+        html = end < 0 ? html + badge : html.slice(0, end) + badge + html.slice(end);
+        document.open();
+        document.write(html);
+        document.close();
+      })();
+    </script>
+  </body>
+</html>
